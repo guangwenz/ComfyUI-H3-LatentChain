@@ -32,6 +32,8 @@ TAKE_TYPE = "H3_TAKE"
 SEGMENTS_TYPE = "MINIMAX_H3_SEGMENTS"
 GUIDE_HANDOFF_VIDEO_TOKENS = 2
 HEADER_KEY = "h3_chain"
+SESSION_NONE = "<no session>"
+UNIT_NONE = "<no unit>"
 
 try:  # core helper module ships with every H3-capable ComfyUI
     from comfy_extras.nodes_minimax_h3 import temporal_shape as _temporal_shape
@@ -103,7 +105,16 @@ def _frame_count(video_tokens: int) -> int:
     return sum(int(FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)]) for index in range(int(video_tokens)))
 
 
-def _chain_root() -> str:
+def _chain_roots() -> list[str]:
+    # input/h3_chain first: farm jobs upload takes as stateless input assets;
+    # output/h3_chain keeps local same-session chaining working with zero setup.
+    return [
+        os.path.join(folder_paths.get_input_directory(), CHAIN_DIR),
+        os.path.join(folder_paths.get_output_directory(), CHAIN_DIR),
+    ]
+
+
+def _output_root() -> str:
     return os.path.join(folder_paths.get_output_directory(), CHAIN_DIR)
 
 
@@ -114,20 +125,22 @@ def _safe_name(value: Any, fallback: str) -> str:
 
 def _session_dir(session: str) -> str:
     session = _safe_name(session, "")
-    root = _chain_root()
-    path = os.path.normpath(os.path.join(root, session))
-    if not path.startswith(os.path.normpath(root) + os.sep) or not os.path.isdir(path):
-        raise ValueError(f"LatentChain session folder not found: {session}")
-    return path
+    for root in _chain_roots():
+        path = os.path.normpath(os.path.join(root, session))
+        if path.startswith(os.path.normpath(root) + os.sep) and os.path.isdir(path):
+            return path
+    raise ValueError(f"LatentChain session folder not found: {session}")
 
 
 def _list_sessions() -> list[str]:
-    root = _chain_root()
-    if not os.path.isdir(root):
-        return []
-    return sorted(
-        name for name in os.listdir(root) if os.path.isdir(os.path.join(root, name)) and _safe_name(name, "")
-    )
+    found = []
+    for root in _chain_roots():
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if os.path.isdir(os.path.join(root, name)) and _safe_name(name, "") and name not in found:
+                found.append(name)
+    return sorted(found)
 
 
 def _list_units(session: str) -> list[str]:
@@ -298,7 +311,7 @@ class MiniMaxH3ChainSave:
         }
         session = _safe_name(session, "session")
         name = _safe_name(name, "take")
-        folder = os.path.join(_chain_root(), session)
+        folder = os.path.join(_output_root(), session)
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, name + ".safetensors")
         from safetensors.torch import save_file
@@ -328,34 +341,44 @@ class MiniMaxH3ChainLoad:
     @classmethod
     def INPUT_TYPES(cls):
         sessions = _list_sessions()
-        session_names = sessions if sessions else ["<no sessions>"]
         units: list[str] = []
-        if sessions:
-            units = _list_units(sessions[0])
-            for session in sessions[1:]:
-                for unit in _list_units(session):
-                    if unit not in units:
-                        units.append(unit)
+        for session in sessions:
+            for unit in _list_units(session):
+                if unit not in units:
+                    units.append(unit)
         return {
             "required": {
-                "session": (session_names, {"tooltip": "Session folder under output/h3_chain (refresh the page to re-scan)."}),
-                "name": (units if units else ["<no units>"], {"tooltip": "Take unit inside the session."}),
+                "session": (sessions + [SESSION_NONE], {"default": sessions[0] if sessions else SESSION_NONE, "tooltip": f"Session folder under output/h3_chain. {SESSION_NONE} = no history yet (first clip of a new session). Refresh the page to re-scan."}),
+                "name": (units + [UNIT_NONE], {"default": units[0] if units else UNIT_NONE, "tooltip": f"Take unit inside the session. {UNIT_NONE} = no history yet. Refresh the page to re-scan."}),
+            },
+            "optional": {
+                "missing_take": (["empty", "error"], {"default": "empty", "tooltip": "empty: emit no take (pass-through) when the unit is not on disk yet; error: fail the run."}),
             },
         }
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         stamp = []
-        root = _chain_root()
-        if os.path.isdir(root):
-            for session in _list_sessions():
+        for root in _chain_roots():
+            if not os.path.isdir(root):
+                continue
+            for session in os.listdir(root):
                 folder = os.path.join(root, session)
-                stamp.append(f"{session}:{os.path.getmtime(folder)}")
+                if os.path.isdir(folder):
+                    stamp.append(f"{os.path.basename(os.path.dirname(root))}/{session}:{os.path.getmtime(folder)}")
         return "|".join(stamp) or "empty"
 
     @classmethod
-    def load(cls, session, name):
-        take = _load_take(session, name)
+    def load(cls, session, name, missing_take="empty"):
+        if session == SESSION_NONE or name == UNIT_NONE:
+            return (None, 0, 0, 24.0, None)
+        try:
+            take = _load_take(session, name)
+        except ValueError:
+            if missing_take == "empty":
+                print(f"[H3 LatentChain] take {session}/{name} not on disk yet: pass-through")
+                return (None, 0, 0, 24.0, None)
+            raise
         frames = int(take.meta.get("frames") or _frame_count(int(take.video.shape[2])))
         width = int(take.meta.get("width") or int(take.video.shape[4]) * 16)
         height = int(take.meta.get("height") or int(take.video.shape[3]) * 16)
@@ -391,8 +414,10 @@ class MiniMaxH3TakeGuide:
             "required": {
                 "positive": ("CONDITIONING", {"tooltip": "New clip's conditioning (MiniMaxH3ImageToVideo / ReferenceToVideo)."}),
                 "latent": ("LATENT", {"tooltip": "New clip's fresh AV latent from the same node."}),
-                "take": (TAKE_TYPE, {"tooltip": "Take handle from LatentChain Load."}),
                 "context": ("INT", {"default": 22, "min": 5, "max": 362, "step": 17, "tooltip": "Boundary history in pixel frames (clips snap to 17k+5)."}),
+            },
+            "optional": {
+                "take": (TAKE_TYPE, {"tooltip": "Take handle from LatentChain Load. Unconnected/empty = pass-through (first clip of a session)."}),
             },
             "optional": {
                 "frame_idx": ("INT", {"default": 0, "min": -9999, "max": 9999, "tooltip": "Frame to anchor the take's tail at. Negative counts from the end. Seam handoff only applies at frame 0."}),
@@ -401,7 +426,9 @@ class MiniMaxH3TakeGuide:
         }
 
     @classmethod
-    def guide(cls, positive, latent, take, context, frame_idx=0, mode="guide"):
+    def guide(cls, positive, latent, context, take=None, frame_idx=0, mode="guide"):
+        if take is None:
+            return (positive, latent, 0)
         if not isinstance(take, H3Take):
             raise ValueError("Take Guide expects a MiniMaxH3ChainLoad take")
         new_video, new_audio = _split_streams(latent, "Take Guide expects a MiniMax H3 AV latent")
