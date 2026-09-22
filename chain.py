@@ -395,6 +395,8 @@ class MiniMaxH3TakeGuide:
     pins only the boundary video tokens plus the full audio overlap into the
     fresh latent's denoise mask, so the model redraws the repeated head and
     recursive degradation is avoided. av_prefix pins the whole overlap.
+    audio_mode="fresh" skips the audio pin entirely: the new take denoises
+    its own wav-conditioned audio from step 0 (video handoff only).
     """
 
     CATEGORY = "latent/chain"
@@ -418,15 +420,14 @@ class MiniMaxH3TakeGuide:
             },
             "optional": {
                 "take": (TAKE_TYPE, {"tooltip": "Take handle from LatentChain Load. Unconnected/empty = pass-through (first clip of a session)."}),
-            },
-            "optional": {
                 "frame_idx": ("INT", {"default": 0, "min": -9999, "max": 9999, "tooltip": "Frame to anchor the take's tail at. Negative counts from the end. Seam handoff only applies at frame 0."}),
                 "mode": (["guide", "av_prefix"], {"default": "guide"}),
+                "audio_mode": (["carry", "fresh"], {"default": "carry", "tooltip": "carry: pin the previous take's audio into the new latent head (legacy). fresh: video-only handoff — the new take keeps its own wav-conditioned audio timeline (lip sync stays frame-exact)."}),
             },
         }
 
     @classmethod
-    def guide(cls, positive, latent, context, take=None, frame_idx=0, mode="guide"):
+    def guide(cls, positive, latent, context, take=None, frame_idx=0, mode="guide", audio_mode="carry"):
         if take is None:
             return (positive, latent, 0)
         if not isinstance(take, H3Take):
@@ -489,11 +490,15 @@ class MiniMaxH3TakeGuide:
                     device=new_video.device, dtype=new_video.dtype
                 )
                 video_mask[:, :, edge_start:video_prefix] = 0.0
-            audio_prefix = min(int(new_audio.shape[-1]), int(audio_window))
-            if audio_prefix > 0:
-                window = _fit_window(_context_audio_window(ref_audio, audio_window), audio_prefix)
-                new_audio[..., :audio_prefix] = window.to(device=new_audio.device, dtype=new_audio.dtype)
-                audio_mask[..., :audio_prefix] = 0.0
+            if audio_mode == "carry":
+                audio_prefix = min(int(new_audio.shape[-1]), int(audio_window))
+                if audio_prefix > 0:
+                    window = _fit_window(_context_audio_window(ref_audio, audio_window), audio_prefix)
+                    new_audio[..., :audio_prefix] = window.to(device=new_audio.device, dtype=new_audio.dtype)
+                    audio_mask[..., :audio_prefix] = 0.0
+            # "fresh": video-only handoff — leave new_audio / audio_mask untouched so
+            # the take's own wav-conditioned audio latent denoises from step 0 and the
+            # mouth stays on its conditioning-wav grid.
 
         if bool(torch.any(video_mask < 1.0)) or bool(torch.any(audio_mask < 1.0)):
             packed = _pack_latent_masks(new_video, new_audio, video_mask, audio_mask)
