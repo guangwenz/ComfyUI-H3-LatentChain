@@ -32,8 +32,8 @@ TAKE_TYPE = "H3_TAKE"
 SEGMENTS_TYPE = "MINIMAX_H3_SEGMENTS"
 GUIDE_HANDOFF_VIDEO_TOKENS = 2
 HEADER_KEY = "h3_chain"
-SESSION_NONE = "<no session>"
-UNIT_NONE = "<no unit>"
+SESSION_NONE = "(no session)"
+UNIT_NONE = "(no unit)"
 
 try:  # core helper module ships with every H3-capable ComfyUI
     from comfy_extras.nodes_minimax_h3 import temporal_shape as _temporal_shape
