@@ -155,15 +155,8 @@ def _list_units(session: str) -> list[str]:
     )
 
 
-def _load_take(session: str, unit: str) -> H3Take:
-    folder = _session_dir(session)
-    base = _safe_name(unit, "")
-    for suffix in (".safetensors", ".pt"):
-        path = os.path.join(folder, base + suffix)
-        if os.path.isfile(path):
-            break
-    else:
-        raise ValueError(f"LatentChain take not found: {session}/{base}")
+def _load_take_from_path(path: str) -> H3Take:
+    """Parse one take file from its full path (shared by session and file loaders)."""
     if path.endswith(".pt"):
         # Legacy ComfyUI-MiniMaxH3-Easy latent-bridge file: {video_latent,
         # audio_latent, meta{width,height,fps,...}} written by torch.save.
@@ -190,6 +183,18 @@ def _load_take(session: str, unit: str) -> H3Take:
     if video is None or audio is None:
         raise ValueError(f"LatentChain file is missing its AV streams: {path}")
     return H3Take(video=video, audio=audio, meta=meta)
+
+
+def _load_take(session: str, unit: str) -> H3Take:
+    folder = _session_dir(session)
+    base = _safe_name(unit, "")
+    for suffix in (".safetensors", ".pt"):
+        path = os.path.join(folder, base + suffix)
+        if os.path.isfile(path):
+            break
+    else:
+        raise ValueError(f"LatentChain take not found: {session}/{base}")
+    return _load_take_from_path(path)
 
 
 def _easy_segments(take: H3Take):
@@ -377,6 +382,87 @@ class MiniMaxH3ChainLoad:
         except ValueError:
             if missing_take == "empty":
                 print(f"[H3 LatentChain] take {session}/{name} not on disk yet: pass-through")
+                return (None, 0, 0, 24.0, None)
+            raise
+        frames = int(take.meta.get("frames") or _frame_count(int(take.video.shape[2])))
+        width = int(take.meta.get("width") or int(take.video.shape[4]) * 16)
+        height = int(take.meta.get("height") or int(take.video.shape[3]) * 16)
+        fps = float(take.meta.get("fps") or 24.0)
+        segments = _easy_segments(take)
+        return (take, width, height, fps, segments)
+
+
+def _resolve_uploaded_take_file(latent_filename: str) -> str:
+    """Resolve an uploaded take file by its input-directory basename.
+
+    Platform jobs upload takes as stateless input assets (balancer fanout
+    lands them flat in the input dir, content-hash named), so they are
+    addressed by filename instead of the session/name combo pair. Only a
+    bare basename is accepted (no subdirs, no traversal); only extensions
+    the take parser understands (.safetensors / .pt) resolve. Returns ""
+    when the name is absent or the file is not on disk yet (caller decides
+    pass-through vs error).
+    """
+    name = str(latent_filename or "").strip().replace("\\", "/")
+    if not name or os.path.basename(name) != name:
+        return ""
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in (".safetensors", ".pt"):
+        return ""
+    path = os.path.join(folder_paths.get_input_directory(), name)
+    return path if os.path.isfile(path) else ""
+
+
+class MiniMaxH3ChainLoadFromFile:
+    """Load a take from an uploaded input-dir file (free-string addressing).
+
+    Same output tuple as ChainLoad, but the take is named by a plain STRING
+    instead of disk-scanned combo enums, so workflow-as-model jobs (Jellyfish
+    /api/v1/film/tasks/video) can reference takes uploaded per-task that no
+    enum could ever list. Empty string = no history (identical to
+    ChainLoad's (no session)/(no unit) sentinels).
+    """
+
+    CATEGORY = "latent/chain"
+    FUNCTION = "load"
+    RETURN_TYPES = (TAKE_TYPE, "INT", "INT", "FLOAT", SEGMENTS_TYPE)
+    RETURN_NAMES = ("take", "width", "height", "fps", "segments")
+    DESCRIPTION = (
+        "Load one LatentChain unit from an uploaded input file (free-string "
+        "filename, no combo scan). Empty = no history yet. Drop-in for "
+        "ChainLoad in API-driven graphs where the take arrives as an upload."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                # STRING, not combo: the file is uploaded per job (content-hash
+                # named), so it can never appear in a static enum list.
+                "latent_filename": ("STRING", {"default": "", "tooltip": "Take file in the input dir (.safetensors/.pt). Empty = no history (head take)."}),
+            },
+            "optional": {
+                "missing_take": (["empty", "error"], {"default": "empty", "tooltip": "empty: emit no take (pass-through) when the file is not uploaded yet; error: fail the run."}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, latent_filename, missing_take="empty"):
+        path = _resolve_uploaded_take_file(latent_filename)
+        return str(os.path.getmtime(path)) if path else "empty"
+
+    @classmethod
+    def load(cls, latent_filename, missing_take="empty"):
+        path = _resolve_uploaded_take_file(latent_filename)
+        if not path:
+            if missing_take == "error" and str(latent_filename or "").strip():
+                raise ValueError(f"LatentChain take file not found in input dir: {latent_filename}")
+            return (None, 0, 0, 24.0, None)
+        try:
+            take = _load_take_from_path(path)
+        except ValueError:
+            if missing_take == "empty":
+                print(f"[H3 LatentChain] take file {latent_filename} failed to load: pass-through")
                 return (None, 0, 0, 24.0, None)
             raise
         frames = int(take.meta.get("frames") or _frame_count(int(take.video.shape[2])))
@@ -612,12 +698,14 @@ class MiniMaxH3KeyframeRescale:
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ChainSave": MiniMaxH3ChainSave,
     "MiniMaxH3ChainLoad": MiniMaxH3ChainLoad,
+    "MiniMaxH3ChainLoadFromFile": MiniMaxH3ChainLoadFromFile,
     "MiniMaxH3TakeGuide": MiniMaxH3TakeGuide,
     "MiniMaxH3KeyframeRescale": MiniMaxH3KeyframeRescale,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ChainSave": "MiniMax H3 Chain Save",
     "MiniMaxH3ChainLoad": "MiniMax H3 Chain Load",
+    "MiniMaxH3ChainLoadFromFile": "MiniMax H3 Chain Load From File",
     "MiniMaxH3TakeGuide": "MiniMax H3 Take Guide (Seam)",
     "MiniMaxH3KeyframeRescale": "MiniMax H3 Keyframe Rescale (Stage 2)",
 }
