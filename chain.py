@@ -507,13 +507,117 @@ class MiniMaxH3TakeGuide:
         return (conditioning, packed, covered)
 
 
+class MiniMaxH3KeyframeRescale:
+    """Rescale chain keyframe anchors to a downstream latent resolution.
+
+    Two-stage graphs (e.g. the 7+1 split-sampling path) refine the upscaled
+    latent in a second pass at 2x resolution. TakeGuide anchors the previous
+    take's tail as a ``minimax_keyframes`` latent at the FIRST-pass
+    resolution; the second pass must see anchors that match its own token
+    grid, or the model's keyframe insertion fails with a token-shape broadcast
+    error (stage-1-sized anchor tokens vs stage-2 anchor slots). This node
+    spatially interpolates every keyframe video latent to match an optional
+    reference AV latent (wire the second stage's packed AV latent), leaving
+    audio keyframes and all other conditioning values untouched. The input
+    conditioning is never mutated, so the same TakeGuide output can still feed
+    the first stage unrescaled.
+    """
+
+    CATEGORY = "latent/chain"
+    FUNCTION = "rescale"
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("positive",)
+    DESCRIPTION = (
+        "Match chain keyframe anchor latents to a second-stage latent "
+        "resolution (two-stage graphs need the stage-2 guider to see "
+        "anchors at ITS resolution)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING", {"tooltip": "Take Guide's positive conditioning."}),
+            },
+            "optional": {
+                "reference_latent": ("LATENT", {"tooltip": "The latent the anchors must match: the second stage's packed AV latent. Required when keyframes are present."}),
+                "mode": (["bilinear", "bicubic", "nearest", "drop"], {"default": "bilinear", "tooltip": "Spatial interpolation for the anchor latents. drop: remove ALL minimax_keyframes from this branch (stage 2 then treats the pinned head like any other token - use when a rescaled anchor conflicts with the pinned values and ghosting appears)."}),
+            },
+        }
+
+    @classmethod
+    def rescale(cls, positive, reference_latent=None, mode="bilinear"):
+        target = None
+        if reference_latent is not None:
+            try:
+                video, _ = _split_streams(
+                    reference_latent,
+                    "Keyframe Rescale expects an H3 AV latent as reference")
+            except ValueError:
+                samples = reference_latent.get("samples") if isinstance(reference_latent, Mapping) else None
+                if isinstance(samples, torch.Tensor) and samples.ndim == 5:
+                    video = samples
+                else:
+                    raise ValueError(
+                        "Keyframe Rescale reference must be an H3 AV latent "
+                        "(packed AV or plain video latent)")
+            target = (int(video.shape[-2]), int(video.shape[-1]))
+        out = []
+        changed = 0
+        dropped = 0
+        for embedding, metadata in positive:
+            values = dict(metadata)
+            keyframes = values.get("minimax_keyframes")
+            if mode == "drop":
+                if keyframes:
+                    values.pop("minimax_keyframes", None)
+                    dropped += len(keyframes)
+                out.append([embedding, values])
+                continue
+            if not keyframes:
+                out.append([embedding, values])
+                continue
+            if target is None:
+                raise ValueError(
+                    "Keyframe Rescale: keyframes present but no "
+                    "reference_latent wired - anchor sizes cannot be matched")
+            new_keyframes = []
+            for kf in keyframes:
+                kf = dict(kf)
+                lat = kf.get("latent")
+                if isinstance(lat, torch.Tensor) and lat.ndim == 5 and target is not None:
+                    if (int(lat.shape[-2]), int(lat.shape[-1])) != target:
+                        # spatial-only upscale: flatten (N, C, T) -> (N, C*T)
+                        # so F.interpolate never touches the temporal axis
+                        n, c, t = int(lat.shape[0]), int(lat.shape[1]), int(lat.shape[2])
+                        flat = lat.reshape(n, c * t, int(lat.shape[-2]), int(lat.shape[-1]))
+                        kwargs = {} if mode == "nearest" else {"align_corners": False}
+                        up = torch.nn.functional.interpolate(
+                            flat, size=target, mode=mode, **kwargs)
+                        kf["latent"] = up.reshape(
+                            n, c, t, int(target[0]), int(target[1])).contiguous()
+                        changed += 1
+                new_keyframes.append(kf)
+            values["minimax_keyframes"] = new_keyframes
+            out.append([embedding, values])
+        if changed:
+            print(f"[H3 LatentChain] Keyframe Rescale: resized {changed} anchor "
+                  f"latent(s) to {target[1]}x{target[0]} ({mode})")
+        if dropped:
+            print(f"[H3 LatentChain] Keyframe Rescale: dropped {dropped} "
+                  f"anchor(s) from this branch (mode=drop)")
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ChainSave": MiniMaxH3ChainSave,
     "MiniMaxH3ChainLoad": MiniMaxH3ChainLoad,
     "MiniMaxH3TakeGuide": MiniMaxH3TakeGuide,
+    "MiniMaxH3KeyframeRescale": MiniMaxH3KeyframeRescale,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ChainSave": "MiniMax H3 Chain Save",
     "MiniMaxH3ChainLoad": "MiniMax H3 Chain Load",
     "MiniMaxH3TakeGuide": "MiniMax H3 Take Guide (Seam)",
+    "MiniMaxH3KeyframeRescale": "MiniMax H3 Keyframe Rescale (Stage 2)",
 }
