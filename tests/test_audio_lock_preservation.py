@@ -1,4 +1,4 @@
-﻿"""Regression test: MiniMaxH3TakeGuide preserves an incoming audio lock.
+"""Regression test: MiniMaxH3TakeGuide preserves an incoming audio lock.
 
 2026-10-14 root cause (s03 chained dialogue lip-drift): MiniMaxH3Easy
 digital_human mode locks the driving track into the target audio latent with a
@@ -96,7 +96,10 @@ def main():
         ),
     }
 
-    # 1) locked incoming + carry: audio plane must survive verbatim
+    # 1) locked incoming + carry: audio plane must survive verbatim; the video
+    #    head must stay FREE (no tail-edge pin — the head-stasis bracket of
+    #    keyframe + pin suppressed speech starting at second 0) and the
+    #    keyframe anchor must shrink to a single tail token (head-take seam).
     cond_l, lat_l, cov_l = chain.MiniMaxH3TakeGuide.guide(
         [[torch.zeros(1), {}]], locked_latent, 22, take=take, frame_idx=0,
         mode="guide", audio_mode="carry",
@@ -106,13 +109,12 @@ def main():
     assert torch.equal(audio_l, tts_audio), "carry overwrote the locked driving track"
     assert torch.equal(amask_l, locked_audio_mask), "audio lock mask was not preserved"
     assert float(amask_l.max()) == 0.0, "audio mask is no longer fully locked"
-    # video seam still applies on a locked take
-    window = chain._tail_tokens(ref_video, prefix_tokens)
-    assert torch.equal(video_l[:, :, prefix_tokens - edge:prefix_tokens],
-                       window[:, :, prefix_tokens - edge:prefix_tokens]), \
-        "locked take lost the video seam pin"
-    assert float(vmask_l[:, :, prefix_tokens - edge:prefix_tokens].min()) == 0.0
-    assert cov_l == chain._frame_count(prefix_tokens)
+    assert float(vmask_l.min()) == 1.0, "locked take still freezes head video tokens"
+    kf = cond_l[0][1]["minimax_keyframes"][-1]
+    assert kf["resolved_frame_index"] == 0
+    assert int(kf["latent"].shape[2]) == 1, \
+        "locked take keyframe anchor is not the single-token tail"
+    assert cov_l == chain._frame_count(1)
 
     # 2) locked incoming + fresh: identical audio outcome (mode ignored when locked)
     cond_f2, lat_f2, _ = chain.MiniMaxH3TakeGuide.guide(

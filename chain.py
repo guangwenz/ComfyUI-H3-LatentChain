@@ -537,8 +537,40 @@ class MiniMaxH3TakeGuide:
         if resolved < 0 or resolved >= new_frames:
             raise ValueError(f"frame_idx {frame_idx} is outside the new clip's {new_frames} frames")
 
-        # conditioning: anchor the take tail (evict any keyframe at the same slot)
-        tail = _tail_tokens(ref_video, prefix_tokens).detach().to("cpu").contiguous()
+        # Detect an incoming audio lock (MiniMaxH3Easy digital_human pins the
+        # driving track into the target audio latent with a zero denoise mask)
+        # BEFORE building anchors — a locked (dialogue) take needs a different
+        # head contract than a generated-audio chain.
+        incoming_mask = latent.get("noise_mask") if isinstance(latent, Mapping) else None
+        incoming_audio_mask = None
+        if incoming_mask is not None:
+            tensors = getattr(incoming_mask, "tensors", None)
+            if isinstance(tensors, (tuple, list)) and len(tensors) >= 2:
+                candidate = tensors[1]
+                expected_shape = tuple(new_audio.shape[:1] + (1,) + new_audio.shape[2:])
+                if (
+                    isinstance(candidate, torch.Tensor)
+                    and tuple(candidate.shape) == expected_shape
+                    and bool(torch.any(candidate < 1.0))
+                ):
+                    incoming_audio_mask = candidate
+        audio_locked = incoming_audio_mask is not None
+
+        # conditioning: anchor the take tail (evict any keyframe at the same slot).
+        #
+        # Head-anchor contract differs by audio state (2026-10-14, s03 t06 lip
+        # suppression): anchoring the full prefix_tokens tail (~1.2s) at frame 0
+        # freezes the model into "continuation of the static tail" for that whole
+        # window — speech starting at second 0 gets no articulation (measured:
+        # "House rules new member" 0-1.27s rendered with a closed mouth while
+        # "loser strips ..." from 1.57s tracked frame-exact). For a LOCKED
+        # dialogue take the seam must behave like a head take's first-frame
+        # keyframe: anchor ONE token (~4 frames) so the cut stays visually
+        # seamless, then leave the head free to articulate with the locked
+        # driving track. Unlocked chains keep the full-tail anchor (their
+        # continuity relies on it).
+        anchor_tokens = 1 if audio_locked else prefix_tokens
+        tail = _tail_tokens(ref_video, anchor_tokens).detach().to("cpu").contiguous()
         keyframes = [
             kf for kf in list(positive[0][1].get("minimax_keyframes", []))
             if int(kf.get("resolved_frame_index", -1)) != resolved
@@ -553,40 +585,18 @@ class MiniMaxH3TakeGuide:
         covered = _frame_count(int(tail.shape[2]))
 
         new_video = new_video.clone()
-        # Preserve an incoming audio lock (MiniMaxH3Easy digital_human pins the
-        # driving track into the target audio latent with a zero denoise mask).
-        # Rebuilding the mask below (legacy behavior) silently discarded that
-        # lock, so chained dialogue takes fully re-denoised their audio stream:
-        # H3 re-spoke the line on an invented schedule (measured rendition
-        # onsets 1.3-6.5s late, lips following its own rendition). Head takes
-        # never touched this branch and stayed frame-exact — the drift was
-        # chain-only. When the incoming audio mask pins anything (<1), the
-        # audio stream and mask pass through verbatim; carry is skipped (the
-        # per-take mux owns the final soundtrack, so generated-audio carry
-        # across the seam is meaningless for a locked track).
-        incoming_audio_mask = None
-        incoming_mask = latent.get("noise_mask") if isinstance(latent, Mapping) else None
-        if incoming_mask is not None:
-            tensors = getattr(incoming_mask, "tensors", None)
-            if isinstance(tensors, (tuple, list)) and len(tensors) >= 2:
-                candidate = tensors[1]
-                expected_shape = tuple(new_audio.shape[:1] + (1,) + new_audio.shape[2:])
-                if (
-                    isinstance(candidate, torch.Tensor)
-                    and tuple(candidate.shape) == expected_shape
-                    and bool(torch.any(candidate < 1.0))
-                ):
-                    incoming_audio_mask = candidate.to(
-                        device=new_video.device, dtype=new_video.dtype
-                    )
-        audio_locked = incoming_audio_mask is not None
-
+        # Preserve the incoming audio lock (detected above): the audio stream
+        # and mask pass through verbatim; carry is skipped (the per-take mux
+        # owns the final soundtrack, so generated-audio carry across the seam
+        # is meaningless for a locked track).
         video_mask = torch.ones(
             new_video.shape[:1] + (1,) + new_video.shape[2:],
             device=new_video.device, dtype=new_video.dtype,
         )
         if audio_locked:
-            audio_mask = incoming_audio_mask
+            audio_mask = incoming_audio_mask.to(
+                device=new_video.device, dtype=new_video.dtype
+            )
         else:
             new_audio = new_audio.clone()
             audio_mask = torch.ones(
@@ -595,25 +605,31 @@ class MiniMaxH3TakeGuide:
             )
 
         if resolved == 0:
-            # latent handoff: pin the boundary so phase and motion direction survive
-            video_prefix = min(int(new_video.shape[2]), int(prefix_tokens))
-            if video_prefix > 0:
-                window = _tail_tokens(ref_video, video_prefix)
-                if mode == "av_prefix":
-                    edge_start = 0
-                else:
-                    edge_start = max(0, video_prefix - min(GUIDE_HANDOFF_VIDEO_TOKENS, video_prefix))
-                new_video[:, :, edge_start:video_prefix] = window[:, :, edge_start:video_prefix].to(
-                    device=new_video.device, dtype=new_video.dtype
-                )
-                video_mask[:, :, edge_start:video_prefix] = 0.0
-            if audio_mode == "carry" and not audio_locked:
-                audio_prefix = min(int(new_audio.shape[-1]), int(audio_window))
-                if audio_prefix > 0:
-                    window = _fit_window(_context_audio_window(ref_audio, audio_window), audio_prefix)
-                    new_audio[..., :audio_prefix] = window.to(device=new_audio.device, dtype=new_audio.dtype)
-                    audio_mask[..., :audio_prefix] = 0.0
-            # "fresh" or audio-locked: video-only handoff — the audio stream and
+            # latent handoff: pin the boundary so phase and motion direction
+            # survive — but NOT on a locked dialogue take: the hard-frozen tail
+            # edge is the second half of the head-stasis bracket (keyframe
+            # anchor + pin) that suppressed speech starting at second 0
+            # (s03 t06). A locked take's seam continuity is carried by the
+            # 1-token keyframe anchor alone.
+            if not audio_locked:
+                video_prefix = min(int(new_video.shape[2]), int(prefix_tokens))
+                if video_prefix > 0:
+                    window = _tail_tokens(ref_video, video_prefix)
+                    if mode == "av_prefix":
+                        edge_start = 0
+                    else:
+                        edge_start = max(0, video_prefix - min(GUIDE_HANDOFF_VIDEO_TOKENS, video_prefix))
+                    new_video[:, :, edge_start:video_prefix] = window[:, :, edge_start:video_prefix].to(
+                        device=new_video.device, dtype=new_video.dtype
+                    )
+                    video_mask[:, :, edge_start:video_prefix] = 0.0
+                if audio_mode == "carry":
+                    audio_prefix = min(int(new_audio.shape[-1]), int(audio_window))
+                    if audio_prefix > 0:
+                        window = _fit_window(_context_audio_window(ref_audio, audio_window), audio_prefix)
+                        new_audio[..., :audio_prefix] = window.to(device=new_audio.device, dtype=new_audio.dtype)
+                        audio_mask[..., :audio_prefix] = 0.0
+            # locked (or "fresh"): video-only handoff — the audio stream and
             # mask stay exactly as the conditioning node produced them (a locked
             # digital-human driving track must reach the sampler un-denoised).
 
