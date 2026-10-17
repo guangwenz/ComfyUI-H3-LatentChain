@@ -742,12 +742,189 @@ class MiniMaxH3KeyframeRescale:
         return (out,)
 
 
+class MiniMaxH3AudioWindowLock:
+    """Unlock H3 audio generation outside a speech window on a dialogue take.
+
+    MiniMaxH3Easy digital_human mode locks the ENTIRE audio timeline
+    (``_lock_audio_latent``: audio_mask all zeros), so a dialogue take renders
+    speech followed by dead room tone — H3 is forbidden from generating any
+    ambience. This node rebuilds that lock into a windowed one: the audio mask
+    stays 0 (keep the driving track verbatim) inside the speech window and
+    becomes 1 (full denoise = H3 generates) everywhere else, so the same single
+    render produces speech AND a generated soundscape. Video stream and video
+    mask are untouched.
+
+    The audio stream itself is ALSO rewritten: reference latent content outside
+    the locked core window is zeroed. Easy's ``_fit_audio_latent`` pads a short
+    track by repeating its LAST latent frame across the whole timeline tail, so
+    an untouched reference tail feeds the sampler quasi-speech content in the
+    to-be-generated region — at low sigmas the model sees that content and
+    reconstructs the line (measured 2026-10-17: the dialogue line repeats in
+    the unlocked tail on every seed and prompt variant). Zeroing makes the
+    unlocked region start from the canonical empty audio state, so the model
+    generates ambience instead of reconstructing speech.
+
+    The mask lives on the audio latent grid (N steps spanning frames/fps
+    seconds); the window is converted with margins and optional linear ramps at
+    both edges. Downstream TakeGuide compatibility is preserved: the mask still
+    contains values < 1, so the audio lock is detected and passed through
+    verbatim (speech stays frame-exact).
+    """
+
+    CATEGORY = "latent/chain"
+    FUNCTION = "apply"
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    DESCRIPTION = (
+        "Windowed audio lock for MiniMax H3 dialogue takes: keep the driving "
+        "track verbatim inside the speech window, let H3 generate ambience "
+        "everywhere else. Insert between Easy Output and Take Guide."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT", {"tooltip": "MiniMax H3 AV latent from Easy Output (digital_human: audio locked)."}),
+                "speech_start_s": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Speech window start in seconds on the clip timeline."}),
+                "speech_end_s": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 3600.0, "step": 0.01, "tooltip": "Speech window end in seconds. >= clip duration = stays fully locked."}),
+            },
+            "optional": {
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.01, "tooltip": "Clip fps used to convert seconds to audio latent steps."}),
+                "head_margin_s": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Extra locked seconds before the speech window (protects word onsets)."}),
+                "tail_margin_s": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Extra locked seconds after the speech window (protects word tails)."}),
+                "ramp_steps": ("INT", {"default": 2, "min": 0, "max": 40, "step": 1, "tooltip": "Linear ramp steps at both window edges (0 = hard cut). ~25ms per step at the 40Hz audio grid."}),
+                "speech_spans": ("STRING", {"default": "", "tooltip": "Optional JSON list of [start_s, end_s] pairs for MULTIPLE dialogue lines (multi-span mode). When non-empty it replaces speech_start_s/speech_end_s; spans are expanded by the margins and merged when they overlap."}),
+                "freeze_video": ("BOOLEAN", {"default": False, "tooltip": "Two-pass mode: set the VIDEO mask to 0 everywhere so the video stream cannot change at all (audio tail refinement against a finished picture)."}),
+            },
+        }
+
+    @classmethod
+    def apply(
+        cls,
+        latent,
+        speech_start_s: float,
+        speech_end_s: float,
+        fps: float = 24.0,
+        head_margin_s: float = 0.2,
+        tail_margin_s: float = 0.4,
+        ramp_steps: int = 2,
+        speech_spans: str = "",
+        freeze_video: bool = False,
+    ):
+        video, audio = _split_streams(latent, "Audio Window Lock expects a MiniMax H3 AV latent")
+        mask = latent.get("noise_mask") if isinstance(latent, Mapping) else None
+        if mask is None:
+            raise ValueError(
+                "Audio Window Lock expects a locked digital_human latent (noise_mask "
+                "with an audio stream). An unlocked latent needs no window lock."
+            )
+        video_mask, audio_mask = mask.tensors[0], mask.tensors[1]
+        if not isinstance(audio_mask, torch.Tensor) or audio_mask.ndim != 4:
+            raise ValueError("Audio Window Lock could not read the packed audio mask")
+
+        frames = _frame_count(int(video.shape[2]))
+        duration_s = frames / float(fps)
+        steps = int(audio.shape[-1])
+        steps_per_second = steps / duration_s
+
+        # Resolve the locked speech spans (seconds, pre-margin). Multi-span mode
+        # (JSON list of [start, end] pairs) replaces the single-window form; a
+        # single window is just a one-span list.
+        raw_spans: list[tuple[float, float]] = []
+        if str(speech_spans or "").strip():
+            try:
+                parsed = json.loads(str(speech_spans))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Audio Window Lock: speech_spans is not valid JSON: {exc}") from None
+            if not isinstance(parsed, list) or not parsed:
+                raise ValueError("Audio Window Lock: speech_spans must be a non-empty JSON list of [start, end] pairs")
+            for pair in parsed:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError(f"Audio Window Lock: speech_spans entry is not a [start, end] pair: {pair!r}")
+                s, e = float(pair[0]), float(pair[1])
+                if e <= s:
+                    raise ValueError(f"Audio Window Lock: speech span end <= start: {pair!r}")
+                raw_spans.append((s, e))
+        else:
+            raw_spans = [(float(speech_start_s), float(speech_end_s))]
+
+        # Expand by margins, clamp to the clip, then merge overlapping/touching
+        # spans (adjacent lines whose margins bridge the gap become one span).
+        ramp = max(0, int(ramp_steps))
+        expanded = []
+        for s, e in raw_spans:
+            lo = int(min(steps, max(0, round((s - float(head_margin_s)) * steps_per_second))))
+            hi = int(min(steps, max(0, round((e + float(tail_margin_s)) * steps_per_second))))
+            expanded.append([lo, hi])
+        expanded.sort(key=lambda item: item[0])
+        merged: list[list[int]] = []
+        for span in expanded:
+            if merged and span[0] <= merged[-1][1] + ramp:
+                # overlapping or ramp-bridging: extend the previous span
+                merged[-1][1] = max(merged[-1][1], span[1])
+            else:
+                merged.append([span[0], span[1]])
+        if merged and merged[0][0] <= ramp:
+            merged[0][0] = 0
+        for span in merged:
+            if span[1] >= steps - ramp:
+                span[1] = steps
+
+        new_audio_mask = torch.ones_like(audio_mask)
+        for lo, hi in merged:
+            if hi > lo:
+                new_audio_mask[..., lo:hi] = 0.0
+            # linear ramps outward from both window edges: 0 at the edge -> 1 outside
+            head_start = max(0, lo - ramp)
+            if head_start < lo:
+                span = lo - head_start
+                weights = torch.linspace(1.0, 0.0, span + 1, device=audio_mask.device, dtype=audio_mask.dtype)[1:]
+                new_audio_mask[..., head_start:lo] = weights.view(*([1] * (audio_mask.ndim - 1)), span)
+            tail_end = min(steps, hi + ramp)
+            if hi < tail_end:
+                span = tail_end - hi
+                weights = torch.linspace(0.0, 1.0, span + 1, device=audio_mask.device, dtype=audio_mask.dtype)[1:]
+                new_audio_mask[..., hi:tail_end] = weights.view(*([1] * (audio_mask.ndim - 1)), span)
+
+        # Zero the reference audio latent outside the locked core window: Easy's
+        # _fit_audio_latent repeats the track's last latent frame across the
+        # tail, which leaks quasi-speech content into the generated region.
+        new_audio = audio.clone()
+        cursor = 0
+        for lo, hi in merged:
+            if lo > cursor:
+                new_audio[..., cursor:lo] = 0.0
+            cursor = max(cursor, hi)
+        if cursor < steps:
+            new_audio[..., cursor:] = 0.0
+
+        # Two-pass mode: pin the entire video stream so it cannot change while
+        # the audio tail regenerates against the finished picture.
+        if freeze_video:
+            video_mask = torch.zeros_like(video_mask)
+
+        packed = _pack_latent_masks(video, new_audio, video_mask, new_audio_mask)
+        locked_s = sum(hi - lo for lo, hi in merged) / steps_per_second
+        span_text = ", ".join(f"{lo / steps_per_second:.2f}-{hi / steps_per_second:.2f}s" for lo, hi in merged)
+        print(
+            f"[H3 LatentChain] Audio Window Lock: {len(merged)} locked span(s) [{span_text}] "
+            f"of {duration_s:.2f}s (steps {steps}, margins +{float(head_margin_s):.2f}/{float(tail_margin_s):.2f}s, "
+            f"locked total {locked_s:.2f}s); "
+            f"audio generation UNLOCKED outside the spans, ramp {ramp} steps, "
+            f"reference audio zeroed outside the spans"
+            + (", video FROZEN (two-pass audio refinement)" if freeze_video else "")
+        )
+        return (packed,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ChainSave": MiniMaxH3ChainSave,
     "MiniMaxH3ChainLoad": MiniMaxH3ChainLoad,
     "MiniMaxH3ChainLoadFromFile": MiniMaxH3ChainLoadFromFile,
     "MiniMaxH3TakeGuide": MiniMaxH3TakeGuide,
     "MiniMaxH3KeyframeRescale": MiniMaxH3KeyframeRescale,
+    "MiniMaxH3AudioWindowLock": MiniMaxH3AudioWindowLock,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ChainSave": "MiniMax H3 Chain Save",
@@ -755,4 +932,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ChainLoadFromFile": "MiniMax H3 Chain Load From File",
     "MiniMaxH3TakeGuide": "MiniMax H3 Take Guide (Seam)",
     "MiniMaxH3KeyframeRescale": "MiniMax H3 Keyframe Rescale (Stage 2)",
+    "MiniMaxH3AudioWindowLock": "MiniMax H3 Audio Window Lock",
 }
